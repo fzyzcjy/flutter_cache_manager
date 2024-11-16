@@ -1,12 +1,7 @@
 import 'dart:async';
+import 'dart:io';
 
-import 'package:flutter_cache_manager/src/config/config.dart';
-import 'package:flutter_cache_manager/src/storage/file_system/file_system.dart';
-import 'package:pedantic/pedantic.dart';
-
-import 'result/file_info.dart';
-import 'storage/cache_info_repositories/cache_info_repository.dart';
-import 'storage/cache_object.dart';
+import 'package:flutter_cache_manager/flutter_cache_manager.dart';
 
 ///Flutter Cache Manager
 ///Copyright (c) 2019 Rene Floor
@@ -21,9 +16,12 @@ class CacheStore {
   FileSystem fileSystem;
 
   final Config _config;
+
   String get storeKey => _config.cacheKey;
   final Future<CacheInfoRepository> _cacheInfoRepository;
+
   int get _capacity => _config.maxNrOfCacheObjects;
+
   Duration get _maxAge => _config.stalePeriod;
 
   DateTime lastCleanupRun = DateTime.now();
@@ -41,6 +39,9 @@ class CacheStore {
       return null;
     }
     final file = await fileSystem.createFile(cacheObject.relativePath);
+    cacheLogger.log(
+        'CacheManager: Loaded $key from cache', CacheManagerLogLevel.verbose);
+
     return FileInfo(
       file,
       FileSource.Cache,
@@ -68,7 +69,7 @@ class CacheStore {
     }
     if (!_futureCache.containsKey(key)) {
       final completer = Completer<CacheObject?>();
-      unawaited(_getCacheDataFromDatabase(key).then((cacheObject) async {
+      _getCacheDataFromDatabase(key).then((cacheObject) async {
         if (cacheObject?.id != null && !await _fileExists(cacheObject)) {
           final provider = await _cacheInfoRepository;
           await provider.delete(cacheObject!.id!);
@@ -81,8 +82,8 @@ class CacheStore {
           _memCache[key] = cacheObject;
         }
         completer.complete(cacheObject);
-        unawaited(_futureCache.remove(key));
-      }));
+        _futureCache.remove(key);
+      });
       _futureCache[key] = completer.future;
     }
     return _futureCache[key];
@@ -102,7 +103,7 @@ class CacheStore {
     if (cacheObject == null) {
       return false;
     }
-    var file = await fileSystem.createFile(cacheObject.relativePath);
+    final file = await fileSystem.createFile(cacheObject.relativePath);
     return file.exists();
   }
 
@@ -110,7 +111,7 @@ class CacheStore {
     final provider = await _cacheInfoRepository;
     final data = await provider.get(key);
     if (await _fileExists(data)) {
-      unawaited(_updateCacheDataInDatabase(data!));
+      _updateCacheDataInDatabase(data!);
     }
     _scheduleCleanup();
     return data;
@@ -137,12 +138,12 @@ class CacheStore {
 
     final overCapacity = await provider.getObjectsOverCapacity(_capacity);
     for (final cacheObject in overCapacity) {
-      unawaited(_removeCachedFile(cacheObject, toRemove));
+      _removeCachedFile(cacheObject, toRemove);
     }
 
     final oldObjects = await provider.getOldObjects(_maxAge);
     for (final cacheObject in oldObjects) {
-      unawaited(_removeCachedFile(cacheObject, toRemove));
+      _removeCachedFile(cacheObject, toRemove);
     }
 
     await provider.deleteAll(toRemove);
@@ -152,9 +153,11 @@ class CacheStore {
     final provider = await _cacheInfoRepository;
     final toRemove = <int>[];
     final allObjects = await provider.getAllObjects();
+    var futures = <Future>[];
     for (final cacheObject in allObjects) {
-      unawaited(_removeCachedFile(cacheObject, toRemove));
+      futures.add(_removeCachedFile(cacheObject, toRemove));
     }
+    await Future.wait(futures);
     await provider.deleteAll(toRemove);
   }
 
@@ -178,16 +181,36 @@ class CacheStore {
       _memCache.remove(cacheObject.key);
     }
     if (_futureCache.containsKey(cacheObject.key)) {
-      unawaited(_futureCache.remove(cacheObject.key));
+      await _futureCache.remove(cacheObject.key);
     }
     final file = await fileSystem.createFile(cacheObject.relativePath);
-    if (await file.exists()) {
-      await file.delete();
+
+    if (file.existsSync()) {
+      try {
+        await file.delete();
+        // ignore: unused_catch_clause
+      } on PathNotFoundException catch (e) {
+        // File has already been deleted. Do nothing #184
+      }
     }
+  }
+
+  bool memoryCacheContainsKey(String key) {
+    return _memCache.containsKey(key);
   }
 
   Future<void> dispose() async {
     final provider = await _cacheInfoRepository;
     await provider.close();
+  }
+
+  Future<int> getCacheSize() async {
+    final provider = await _cacheInfoRepository;
+    final allObjects = await provider.getAllObjects();
+    int total = 0;
+    for (var cacheObject in allObjects) {
+      total += cacheObject.length ?? 0;
+    }
+    return total;
   }
 }
